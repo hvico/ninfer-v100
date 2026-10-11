@@ -26,6 +26,14 @@ struct workspace_layout {
     TensorRegion U;
     TensorRegion v_new;
     TensorRegion h_chunk;
+#ifdef NINFER_VOLTA_BUILD
+    // sm_70 WMMA stages (launch_volta.cu) read FP16 operands straight from global memory: the
+    // prepare stage writes FP16 copies of q and k (indexed by Q/K head; sized by the value-head
+    // count, an upper bound, because the layout is keyed by value heads only), and W, U, v_new
+    // and h_chunk hold FP16 values in their BF16-typed regions (same size, private to the route).
+    TensorRegion q16;
+    TensorRegion k16;
+#endif
     std::size_t total_bytes = 0;
 };
 
@@ -41,6 +49,10 @@ inline workspace_layout compute_workspace_layout(std::int32_t value_heads, std::
         builder.add_tensor(DType::BF16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "v_new");
     w.h_chunk     = builder.add_tensor(DType::BF16, {kStateDim, kStateDim, value_heads, chunks},
                                        kWorkspaceAlign, "h_chunk");
+#ifdef NINFER_VOLTA_BUILD
+    w.q16 = builder.add_tensor(DType::FP16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "q16");
+    w.k16 = builder.add_tensor(DType::FP16, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "k16");
+#endif
     w.total_bytes = builder.finish(kWorkspaceAlign, "Gated DeltaNet chunk workspace");
     return w;
 }

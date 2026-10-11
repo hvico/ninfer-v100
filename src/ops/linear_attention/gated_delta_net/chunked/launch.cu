@@ -14,6 +14,7 @@ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t token
     return chunked::workspace_bytes(value_heads, tokens);
 }
 
+#ifndef NINFER_VOLTA_BUILD // the sm_70 build defines launch_chunked in launch_volta.cu
 void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                     const Tensor& beta, float scale, const Tensor& ssm_state_in,
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
@@ -71,5 +72,6 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     output.stream   = stream;
     CUDA_CHECK(chunked::launch_output(output));
 }
+#endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail::gated_delta_net

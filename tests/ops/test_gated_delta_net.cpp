@@ -467,6 +467,11 @@ int main() {
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    // Prefill-length runs: many chunks of state passing (the sm_70 WMMA route keeps the running
+    // state in FP32 across all of them), plus a chunk/tail boundary after a long prefix.
+    failures += distinct_state_case({"35b long prefill fused-qk-norm", 16, 32, 1024, true}, 12324u);
+    failures += inplace_case({"35b long prefill chunk-tail", 16, 32, 2049, true}, 12349u);
+    failures += distinct_state_case({"27b prefill fused-qk-norm", 16, 48, 512, true}, 12412u);
 
     // The production decode path updates selected state-pool slots in place at width one.
     failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,
