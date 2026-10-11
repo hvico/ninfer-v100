@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -26,6 +27,7 @@ enum class W8LinearAddScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
+    CutlassSm70, // Volta wide-T: FP16 dequant + CUTLASS Sm70 tensor-core GEMM, beta=1
 };
 
 struct W8LinearAddPlan {
@@ -43,10 +45,12 @@ const char* w8_linear_add_schedule_name(W8LinearAddScheduleId schedule) noexcept
 bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept;
 bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept;
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem);
+// Exact transient bytes the resolved schedule takes from the caller's arena (0 except CutlassSm70).
+[[nodiscard]] std::size_t w8_linear_add_workspace_bytes(const W8LinearAddProblem& problem);
 
 void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, cudaStream_t stream);
+                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream);
 void w8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            cudaStream_t stream);
+                            WorkspaceArena& ws, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

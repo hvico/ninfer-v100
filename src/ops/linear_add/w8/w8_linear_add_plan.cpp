@@ -2,6 +2,9 @@
 
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 #include "ops/common/token_slices.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/w8/w8_cutlass_sm70.h"
+#endif
 
 #include <array>
 #include <limits>
@@ -100,6 +103,7 @@ std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
     case W8LinearAddScheduleId::MmaR128C80:
         return 128;
     case W8LinearAddScheduleId::SplitKMmaExactT:
+    case W8LinearAddScheduleId::CutlassSm70:
         break;
     }
     throw std::logic_error("w8 linear_add: exact-T schedule has no row tile");
@@ -138,6 +142,7 @@ std::int32_t schedule_cols(W8LinearAddScheduleId schedule) {
     case W8LinearAddScheduleId::MmaR64C128:
         return 128;
     case W8LinearAddScheduleId::SplitKMmaExactT:
+    case W8LinearAddScheduleId::CutlassSm70:
         break;
     }
     throw std::logic_error("w8 linear_add: exact-T schedule is not token-sliced");
@@ -181,6 +186,8 @@ const char* w8_linear_add_schedule_name(W8LinearAddScheduleId schedule) noexcept
         return "linear_add.w8.mma.r128.c64.residual";
     case W8LinearAddScheduleId::MmaR128C80:
         return "linear_add.w8.mma.r128.c80.residual";
+    case W8LinearAddScheduleId::CutlassSm70:
+        return "linear_add.w8.cutlass.sm70.residual";
     }
     return "linear_add.w8.unknown";
 }
@@ -194,6 +201,13 @@ bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     return problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144) &&
            problem.padded_k == problem.k && problem.cols >= 1;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+// Lower edge of the CUTLASS route; below it the fixed cost of dequantizing the whole weight is
+// not amortized. Measured with ninfer_w8_linear_add_bench; see docs/v100.md,
+// "35B-A3B prefill on tensor cores".
+constexpr std::int32_t kVoltaCutlassFirstCols = 48;
+#endif
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     if (!w8_linear_add_admits(problem)) {
@@ -212,6 +226,9 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         return {problem.k == 6144 ? W8LinearAddScheduleId::DecodeR16
                                   : W8LinearAddScheduleId::SimtR8C4};
     }
+    // Wide T goes to tensor cores: FP16 dequant of the [2048,k] weight plus a CUTLASS Sm70 GEMM
+    // whose epilogue adds the residual (w8_cutlass_sm70.h). SimtR8C4 runs at ~4.5 TFLOP/s here.
+    if (problem.cols >= kVoltaCutlassFirstCols) { return {W8LinearAddScheduleId::CutlassSm70}; }
     return {W8LinearAddScheduleId::SimtR8C4};
 #else
     const auto resolve_from = [&](const auto& routes) -> W8LinearAddPlan {
@@ -226,13 +243,35 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
 #endif // NINFER_VOLTA_BUILD
 }
 
+std::size_t w8_linear_add_workspace_bytes(const W8LinearAddProblem& problem) {
+    const W8LinearAddPlan plan = w8_linear_add_resolve_plan(problem);
+#ifdef NINFER_VOLTA_BUILD
+    if (plan.schedule == W8LinearAddScheduleId::CutlassSm70) {
+        return w8_cutlass_sm70_workspace_bytes(problem.rows, problem.k, problem.cols, problem.rows,
+                                               /*accumulate=*/true);
+    }
+#endif
+    (void)plan;
+    return 0;
+}
+
 void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, cudaStream_t stream) {
+                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
     const W8LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const W8LinearAddPlan resolved = w8_linear_add_resolve_plan(problem);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("w8 linear_add: plan does not match the exact problem");
     }
+    if (plan.schedule == W8LinearAddScheduleId::CutlassSm70) {
+#ifdef NINFER_VOLTA_BUILD
+        const W8CutlassSm70Output output{&residual_out, 0, residual_out.ne[0]};
+        w8_cutlass_sm70_launch(x, w, &output, 1, /*accumulate=*/true, ws, stream);
+        return;
+#else
+        throw std::logic_error("w8 linear_add: CutlassSm70 is Volta-only");
+#endif
+    }
+    (void)ws;
     if (plan.schedule == W8LinearAddScheduleId::DecodeR16) {
         w8_linear_add_decode_r16_launch(x, w, residual_out, stream);
         return;
@@ -297,6 +336,7 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
                 w8_linear_add_mma_r128_c80_launch(full, x_slice, w, residual_slice, stream);
                 return;
             case W8LinearAddScheduleId::SplitKMmaExactT:
+            case W8LinearAddScheduleId::CutlassSm70:
                 break;
             }
             throw std::logic_error("w8 linear_add: unknown tiled schedule");
@@ -304,9 +344,10 @@ void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, co
 }
 
 void w8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            cudaStream_t stream) {
+                            WorkspaceArena& ws, cudaStream_t stream) {
     const W8LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
-    w8_linear_add_execute_plan(w8_linear_add_resolve_plan(problem), x, w, residual_out, stream);
+    w8_linear_add_execute_plan(w8_linear_add_resolve_plan(problem), x, w, residual_out, ws,
+                               stream);
 }
 
 } // namespace ninfer::ops::detail

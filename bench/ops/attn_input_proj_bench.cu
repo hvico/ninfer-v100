@@ -576,7 +576,7 @@ int main(int argc, char** argv) {
         if (selected(options.format, Format::W8Qgkv)) {
             auto weight = bench::make_row_split_weight(QType::W8G32_F16S, 9216, 2048, 2048,
                                                        {0x31, 0x00, 0x3c00});
-            run_four_output(options, "w8-qgkv", QType::W8G32_F16S, ops::LinearPolicy::A16Only, true,
+            run_four_output(options, "w8-qgkv", QType::W8G32_F16S, ops::LinearPolicy::A16Only, false,
                             2048, 4096, 512, 9216, weight, flush, stream, results);
         }
         if (selected(options.format, Format::W8Qkv)) {

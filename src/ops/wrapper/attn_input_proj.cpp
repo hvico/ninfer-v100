@@ -10,6 +10,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -167,7 +168,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_w8_rowsplit(weight, kRows, 2048, "query/key/gate/value weight");
-    detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
+    detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, workspace, stream);
 }
 
 } // namespace
@@ -204,11 +205,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }
-        (void)detail::w8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
-        (void)detail::w8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
-        return 0;
+        // Only the Volta CUTLASS route stages anything; its need is monotonic in T.
+        return std::max(detail::w8_attn_input_workspace_bytes(
+                            {input_rows, 4096, 512, parent_rows, input_rows, min_tokens}),
+                        detail::w8_attn_input_workspace_bytes(
+                            {input_rows, 4096, 512, parent_rows, input_rows, max_tokens}));
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
     case QType::Q6G64_F16S:

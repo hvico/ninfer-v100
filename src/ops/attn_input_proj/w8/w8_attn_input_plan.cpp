@@ -1,6 +1,9 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/w8/w8_cutlass_sm70.h"
+#endif
 
 #include <array>
 #include <limits>
@@ -95,6 +98,8 @@ const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.w8.mma.r128.c80";
     case W8AttnInputScheduleId::Dflash2SimtSplit:
         return "attn_input_proj.w8.dflash2.simt.split.k5120";
+    case W8AttnInputScheduleId::CutlassSm70:
+        return "attn_input_proj.w8.cutlass.sm70";
     }
     return "attn_input_proj.w8.unknown";
 }
@@ -102,6 +107,13 @@ const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept
 bool w8_attn_input_admits(const W8AttnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols > 0;
 }
+
+#ifdef NINFER_VOLTA_BUILD
+// Lower edge of the CUTLASS route; below it the fixed cost of dequantizing the whole parent is
+// not amortized. Measured with ninfer_attn_input_proj_bench; see docs/v100.md,
+// "35B-A3B prefill on tensor cores".
+constexpr std::int32_t kVoltaCutlassFirstCols = 32;
+#endif
 
 W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     if (!w8_attn_input_admits(problem)) {
@@ -117,6 +129,11 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     // T=1 keeps DecodeR8Direct: it is already SIMT and is the decode schedule
     // this port tuned for the 27B target, which shares this Op.
     if (problem.cols == 1) { return {W8AttnInputScheduleId::DecodeR8Direct}; }
+    // Wide T on the four-output [9216,2048] parent goes to tensor cores (w8_cutlass_sm70.h):
+    // SimtR8C4 runs at ~3.3 TFLOP/s there. The three-output companion keeps SimtR8C4.
+    if (problem.cols >= kVoltaCutlassFirstCols && problem.parent_rows == 9216) {
+        return {W8AttnInputScheduleId::CutlassSm70};
+    }
     return {W8AttnInputScheduleId::SimtR8C4};
 #else
     const auto resolve_from = [&](const auto& routes) -> W8AttnInputPlan {
@@ -132,6 +149,18 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
 #endif // NINFER_VOLTA_BUILD
 }
 
+std::size_t w8_attn_input_workspace_bytes(const W8AttnInputProblem& problem) {
+    const W8AttnInputPlan plan = w8_attn_input_resolve_plan(problem);
+#ifdef NINFER_VOLTA_BUILD
+    if (plan.schedule == W8AttnInputScheduleId::CutlassSm70) {
+        return w8_cutlass_sm70_workspace_bytes(problem.parent_rows, problem.padded_k, problem.cols,
+                                               problem.query_rows, /*accumulate=*/false);
+    }
+#endif
+    (void)plan;
+    return 0;
+}
+
 void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
                                 Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                                 cudaStream_t stream) {
@@ -144,6 +173,9 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
             "W8 attention input: plan does not match exact four-output problem");
     }
     switch (plan.schedule) {
+    case W8AttnInputScheduleId::CutlassSm70:
+        // Needs an arena; w8_attn_input_dispatch() routes it before reaching this table.
+        throw std::logic_error("W8 attention input: CutlassSm70 needs a workspace");
     case W8AttnInputScheduleId::DecodeR8Direct:
         w8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
@@ -171,11 +203,28 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
 }
 
 void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                            Tensor& k, Tensor& v, cudaStream_t stream) {
+                            Tensor& k, Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
     const W8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
-    w8_attn_input_execute_plan(w8_attn_input_resolve_plan(problem), x, weight, q, gate, k, v,
-                               stream);
+    const W8AttnInputPlan plan = w8_attn_input_resolve_plan(problem);
+    if (plan.schedule == W8AttnInputScheduleId::CutlassSm70) {
+#ifdef NINFER_VOLTA_BUILD
+        if (workspace == nullptr) {
+            w8_attn_input_simt_r8_c4_launch(x, weight, q, gate, k, v, stream);
+            return;
+        }
+        // Parent rows are stored query, key, gate, value; each output is its own allocation.
+        const std::int32_t qr = q.ne[0];
+        const std::int32_t kr = k.ne[0];
+        const W8CutlassSm70Output outputs[4]{
+            {&q, 0, qr}, {&k, qr, kr}, {&gate, qr + kr, qr}, {&v, 2 * qr + kr, kr}};
+        w8_cutlass_sm70_launch(x, weight, outputs, 4, /*accumulate=*/false, *workspace, stream);
+        return;
+#else
+        throw std::logic_error("W8 attention input: CutlassSm70 is Volta-only");
+#endif
+    }
+    w8_attn_input_execute_plan(plan, x, weight, q, gate, k, v, stream);
 }
 
 void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
@@ -222,6 +271,8 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
     case W8AttnInputScheduleId::MmaR64C128:
         w8_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
         return;
+    case W8AttnInputScheduleId::CutlassSm70:
+        throw std::logic_error("W8 attention input: schedule not valid for this output form");
     }
     throw std::logic_error("W8 attention input: unknown schedule");
 }

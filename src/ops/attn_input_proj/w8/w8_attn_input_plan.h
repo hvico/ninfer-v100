@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -21,6 +22,7 @@ enum class W8AttnInputScheduleId {
     MmaR128C64,
     MmaR128C80,
     Dflash2SimtSplit, // DFlash2 draft QKV W8 [6144,5120] direct split output (sm_70)
+    CutlassSm70,      // Volta wide T, four-output form: FP16 dequant + CUTLASS Sm70 GEMMs
 };
 
 struct W8AttnInputProblem {
@@ -39,13 +41,17 @@ struct W8AttnInputPlan {
 const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept;
 bool w8_attn_input_admits(const W8AttnInputProblem& problem) noexcept;
 W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem);
+// Exact transient bytes the resolved four-output schedule takes when given an arena.
+[[nodiscard]] std::size_t w8_attn_input_workspace_bytes(const W8AttnInputProblem& problem);
 
 void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
                                 Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
                                 Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream);
+// `workspace` may be null (the Op's no-workspace overload): CutlassSm70 then degrades to the
+// in-place SIMT route, as gdn_input_proj's CutlassSm70 does.
 void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                            Tensor& k, Tensor& v, cudaStream_t stream);
+                            Tensor& k, Tensor& v, WorkspaceArena* workspace, cudaStream_t stream);
 void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                             cudaStream_t stream);
 

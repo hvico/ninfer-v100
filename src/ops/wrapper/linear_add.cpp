@@ -10,6 +10,7 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -97,9 +98,11 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_add workspace: W8 admits only A16");
         }
-        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
-        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
-        return 0;
+        // Only the Volta CUTLASS route stages anything, and its need (the fixed FP16 weight plus
+        // an activation cast that grows with T) is monotonic in T, so the endpoints bound it.
+        return std::max(
+            detail::w8_linear_add_workspace_bytes({output_rows, input_rows, input_rows, min_tokens}),
+            detail::w8_linear_add_workspace_bytes({output_rows, input_rows, input_rows, max_tokens}));
     }
     if (qtype == QType::Q5G64_F16S) {
         if (policy != LinearPolicy::A16Only) {
@@ -196,8 +199,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: W8 requires 16-byte x/residual/code/scale alignment");
         }
-        (void)ws;
-        detail::w8_linear_add_dispatch(x, w, residual_out, stream);
+        detail::w8_linear_add_dispatch(x, w, residual_out, ws, stream);
         return;
     }
 
