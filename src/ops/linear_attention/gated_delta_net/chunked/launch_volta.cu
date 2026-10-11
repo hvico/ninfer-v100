@@ -6,13 +6,13 @@
 //   prepare   N[i][j] = -b_i (k_i.k_j) exp(G_i - G_j) for i > j, else 0
 //             T = (I - N)^{-1}               (FP32 forward substitution, in place)
 //             W = T (b exp(G) . K),  U = T (b . V)                         -> BF16 workspace
-//   state     h_chunk[c] = bf16(h);  v_new = U - W h;  store bf16(v_new)
+//   state     v_new = U - W h;  inter = exp(G_t) q_t h  (h = state at chunk start)
 //             h = exp(G_63) h + K^T (exp(G_63 - G_i) . v_new)            (FP32 state)
-//   output    o_t = scale (exp(G_t) q_t h_c + sum_{s<=t} (q_t.k_s) exp(G_t - G_s) v_new_s)
+//   output    o_t = scale (inter_t + sum_{s<=t} (q_t.k_s) exp(G_t - G_s) v_new_s)
 //
 // Differences from the sm_80 kernels, all private: T is inverted in FP32 SIMT (16x16 diagonal
 // blocks by forward substitution, then the off-diagonal blocks column by column) instead of TF32
-// block Schur; W, U, v_new and h_chunk hold FP16 (natural column order) in their BF16-typed
+// block Schur; W, U, v_new and inter hold FP16 (natural column order) in BF16-typed
 // workspace regions, plus FP16 copies of q and k (Volta-only regions), so the WMMA operands load
 // straight from global memory and the stages need 25-50 KiB of shared memory; every exp is the
 // accurate expf. Operands the sm_80 path feeds to TF32 MMAs are FP16 here (same 10-bit mantissa,
@@ -290,25 +290,33 @@ __global__ __launch_bounds__(kPrepThreads, 2) void gdn_volta_prepare_kernel(
 }
 
 // --------------------------------------------------------------------------------------------
-// Stage 2: sequential state passing.  One CTA = one value head x a 16-column dv strip; the W
-// and K^T operands come straight from the FP16 workspace, so 4 CTAs fit per SM.
+// Stage 2: sequential state passing.  One CTA = one value head x a 32-column dv strip; the W,
+// q and K^T operands come straight from the FP16 workspace. It also produces the inter-chunk
+// output term exp(G_t) q_t h_c, so h_c never leaves the SM (the sm_80 route stores h_chunk and
+// the output stage reads it back: 2x 32 KiB per chunk and head).
 // --------------------------------------------------------------------------------------------
-constexpr int kStrip   = 16;
-constexpr int kStripLd = kStrip + 4; // FP32
-constexpr int kStripHd = kStrip + 8; // FP16
+constexpr int kStrip        = 32;
+constexpr int kStripLd      = kStrip + 4; // FP32
+constexpr int kStripHd      = kStrip + 8; // FP16
+constexpr int kStateThreads = 256;        // 8 warps: one output tile per warp in each product
 
 struct StateSmem {
-    float hf[kD][kStripLd];   // h[dk][dv] FP32, the running state
-    __half hh[kD][kStripHd];  // FP16 copy for W h
+    float hf[kD][kStripLd]; // h[dk][dv] FP32, the running state
+    union {
+        __half hh[kD][kStripHd];  // FP16 copy of h_c, the B operand of W h_c and q h_c
+        float tmp[kBT][kStripLd]; // then W h_c (hh is dead by the time it is stored)
+    };
+    float qh[kBT][kStripLd];  // q h_c (the inter-chunk output term, before exp(G_t))
     __half vd[kBT][kStripHd]; // exp(G_63 - G_i) v_new
-    float tmp[kBT][kStripLd]; // W h
     float g[kBT];
 };
 
-__global__ __launch_bounds__(kThreads, 2) void gdn_volta_state_kernel(
+// 128 CTAs for the 35B-A3B shape (32 value heads x 4 strips), 2 per SM: one wave on a V100.
+__global__ __launch_bounds__(kStateThreads, 2) void gdn_volta_state_kernel(
     const __half* __restrict__ W, const __half* __restrict__ U, const __half* __restrict__ k16,
-    const float* __restrict__ g_cumsum, const float* state_in, __half* __restrict__ v_new,
-    __half* __restrict__ h_chunk, float* state_out, int H_qk, int H_v, int chunks) {
+    const __half* __restrict__ q16, const float* __restrict__ g_cumsum, const float* state_in,
+    __half* __restrict__ v_new, __half* __restrict__ inter, float* state_out, int H_qk, int H_v,
+    int chunks) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     StateSmem& s = *reinterpret_cast<StateSmem*>(smem_raw);
     const int tid    = static_cast<int>(threadIdx.x);
@@ -316,13 +324,13 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_volta_state_kernel(
     const int strips = kD / kStrip;
     const int h      = static_cast<int>(blockIdx.x) / strips;
     const int dv0    = (static_cast<int>(blockIdx.x) % strips) * kStrip;
-    const int qh     = h / (H_v / H_qk);
+    const int qkh    = h / (H_v / H_qk);
     const std::int64_t state_base = static_cast<std::int64_t>(h) * kD * kD;
     const std::int64_t row_v      = static_cast<std::int64_t>(H_v) * kD;
     const std::int64_t row_qk     = static_cast<std::int64_t>(H_qk) * kD;
 
     // Read exactly this CTA's state elements (state_in may alias state_out).
-    for (int idx = tid; idx < kD * kStrip; idx += kThreads) {
+    for (int idx = tid; idx < kD * kStrip; idx += kStateThreads) {
         const int dvl = idx / kD;
         const int dk  = idx % kD;
         s.hf[dk][dvl] = state_in[state_base + static_cast<std::int64_t>(dv0 + dvl) * kD + dk];
@@ -332,68 +340,86 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_volta_state_kernel(
     for (int c = 0; c < chunks; ++c) {
         const std::int64_t t0 = static_cast<std::int64_t>(c) * kBT;
         if (tid < kBT) { s.g[tid] = g_cumsum[(t0 + tid) * H_v + h]; }
-        // h_chunk[c] = state at chunk start (FP16); FP16 copy for the W h product.
-        __half* hc = h_chunk + ((static_cast<std::int64_t>(c) * H_v + h) * kD + dv0) * kD;
-        for (int idx = tid; idx < kD * kStrip; idx += kThreads) {
-            const int dvl = idx / kD;
-            const int dk  = idx % kD;
-            const __half x = __float2half_rn(s.hf[dk][dvl]);
-            hc[static_cast<std::int64_t>(dvl) * kD + dk] = x;
-            s.hh[dk][dvl] = x;
+        for (int idx = tid; idx < kD * kStrip; idx += kStateThreads) {
+            s.hh[idx / kStrip][idx % kStrip] = __float2half_rn(s.hf[idx / kStrip][idx % kStrip]);
         }
         __syncthreads();
 
-        { // tmp[64][16] = W[64][128] h[128][16]: one row tile per warp
-            const __half* wrow = W + ((t0 + warp * 16) * H_v + h) * kD;
-            FragAcc acc;
-            wmma::fill_fragment(acc, 0.0f);
+        { // W h_c and q h_c, [64][32] each: warp -> (row tile warp&3, column tile warp>>2)
+            const int ti = warp & 3;
+            const int tj = warp >> 2;
+            const __half* wrow = W + ((t0 + ti * 16) * H_v + h) * kD;
+            const __half* qrow = q16 + (t0 + ti * 16) * row_qk + qkh * kD;
+            FragAcc acc_w;
+            FragAcc acc_q;
+            wmma::fill_fragment(acc_w, 0.0f);
+            wmma::fill_fragment(acc_q, 0.0f);
 #pragma unroll
             for (int kk = 0; kk < kD / 16; ++kk) {
-                FragA a;
+                FragA aw;
+                FragA aq;
                 FragB b;
-                wmma::load_matrix_sync(a, wrow + kk * 16, static_cast<unsigned>(row_v));
-                wmma::load_matrix_sync(b, &s.hh[kk * 16][0], kStripHd);
-                wmma::mma_sync(acc, a, b, acc);
+                wmma::load_matrix_sync(b, &s.hh[kk * 16][tj * 16], kStripHd);
+                wmma::load_matrix_sync(aw, wrow + kk * 16, static_cast<unsigned>(row_v));
+                wmma::load_matrix_sync(aq, qrow + kk * 16, static_cast<unsigned>(row_qk));
+                wmma::mma_sync(acc_w, aw, b, acc_w);
+                wmma::mma_sync(acc_q, aq, b, acc_q);
             }
-            wmma::store_matrix_sync(&s.tmp[warp * 16][0], acc, kStripLd, wmma::mem_row_major);
+            __syncthreads(); // every warp is done reading hh, which tmp overlays
+            wmma::store_matrix_sync(&s.tmp[ti * 16][tj * 16], acc_w, kStripLd,
+                                    wmma::mem_row_major);
+            wmma::store_matrix_sync(&s.qh[ti * 16][tj * 16], acc_q, kStripLd,
+                                    wmma::mem_row_major);
         }
         __syncthreads();
 
         const float g_last = s.g[kBT - 1];
-        for (int idx = tid; idx < kBT * kStrip; idx += kThreads) {
+        for (int idx = tid; idx < kBT * kStrip; idx += kStateThreads) {
             const int i   = idx / kStrip;
             const int dvl = idx % kStrip;
             const std::int64_t at = (t0 + i) * row_v + h * kD + dv0 + dvl;
             const float vn = __half2float(U[at]) - s.tmp[i][dvl];
             v_new[at]      = __float2half_rn(vn);
+            inter[at]      = __float2half_rn(s.qh[i][dvl] * expf(s.g[i]));
             s.vd[i][dvl]   = __float2half_rn(vn * expf(g_last - s.g[i]));
         }
         const float gamma = expf(g_last);
-        for (int idx = tid; idx < kD * kStrip; idx += kThreads) {
+        for (int idx = tid; idx < kD * kStrip; idx += kStateThreads) {
             s.hf[idx / kStrip][idx % kStrip] *= gamma;
         }
         __syncthreads();
 
-        // h[128][16] += K^T[128][64] vd[64][16]: 8 row tiles, 2 per warp; K^T read column-major
-        // straight from the FP16 copy of k.
-        for (int ti = warp; ti < kD / 16; ti += kThreads / 32) {
-            FragAcc acc;
-            wmma::load_matrix_sync(acc, &s.hf[ti * 16][0], kStripLd, wmma::mem_row_major);
+        { // h[128][32] += K^T[128][64] vd[64][32]: warp -> row tile `warp`, both column tiles;
+          // K^T is read column-major straight from the FP16 copy of k.
+            const int ti = warp;
+            FragAcc acc[kStrip / 16];
+#pragma unroll
+            for (int tj = 0; tj < kStrip / 16; ++tj) {
+                wmma::load_matrix_sync(acc[tj], &s.hf[ti * 16][tj * 16], kStripLd,
+                                       wmma::mem_row_major);
+            }
 #pragma unroll
             for (int kk = 0; kk < kBT / 16; ++kk) {
                 FragAT a;
-                FragB b;
-                wmma::load_matrix_sync(a, k16 + (t0 + kk * 16) * row_qk + qh * kD + ti * 16,
+                wmma::load_matrix_sync(a, k16 + (t0 + kk * 16) * row_qk + qkh * kD + ti * 16,
                                        static_cast<unsigned>(row_qk));
-                wmma::load_matrix_sync(b, &s.vd[kk * 16][0], kStripHd);
-                wmma::mma_sync(acc, a, b, acc);
+#pragma unroll
+                for (int tj = 0; tj < kStrip / 16; ++tj) {
+                    FragB b;
+                    wmma::load_matrix_sync(b, &s.vd[kk * 16][tj * 16], kStripHd);
+                    wmma::mma_sync(acc[tj], a, b, acc[tj]);
+                }
             }
-            wmma::store_matrix_sync(&s.hf[ti * 16][0], acc, kStripLd, wmma::mem_row_major);
+#pragma unroll
+            for (int tj = 0; tj < kStrip / 16; ++tj) {
+                wmma::store_matrix_sync(&s.hf[ti * 16][tj * 16], acc[tj], kStripLd,
+                                        wmma::mem_row_major);
+            }
         }
         __syncthreads();
     }
 
-    for (int idx = tid; idx < kD * kStrip; idx += kThreads) {
+    for (int idx = tid; idx < kD * kStrip; idx += kStateThreads) {
         const int dvl = idx / kD;
         const int dk  = idx % kD;
         state_out[state_base + static_cast<std::int64_t>(dv0 + dvl) * kD + dk] = s.hf[dk][dvl];
@@ -401,111 +427,131 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_volta_state_kernel(
 }
 
 // --------------------------------------------------------------------------------------------
-// Stage 3: output.  Grid (chunks, H_v, 2): one CTA = one chunk x value head x 64 dv columns;
-// every operand but the masked score tile comes straight from global FP16.
+// Stage 3: output.  One CTA = one chunk x value head, 8 warps over the full 128 dv:
+//   o = scale (inter + A v_new),  A[t][s] = (q_t.k_s) exp(G_t - G_s) for s <= t (diagonal in).
+// q and k are staged with coalesced loads (their buffers are then reused for v_new and the
+// per-warp epilogue staging); A is built tile by tile from the q k^T accumulators.
 // --------------------------------------------------------------------------------------------
-constexpr int kOutCols = 64;
+constexpr int kOutThreads = 256;
 
 struct OutputSmem {
-    float f[kBT][kF32Ld64]; // q k^T, later the FP32 output tile
-    __half a[kBT][kTileLd]; // masked, gated q k^T
+    __half qv[kBT][kHalfLd];   // q, then v_new
+    union {
+        __half k[kBT][kHalfLd]; // k
+        float stage[8][16 * 16]; // then per-warp FP32 staging
+    };
+    __half a[kBT][kTileLd];    // masked, gated q k^T
     float g[kBT];
 };
 
-__global__ __launch_bounds__(kThreads, 3) void gdn_volta_output_kernel(
+__device__ __forceinline__ void load_rows_f16(const __half* __restrict__ src,
+                                              std::int64_t row_stride, __half (*dst)[kHalfLd]) {
+    for (int idx = static_cast<int>(threadIdx.x); idx < kBT * (kD / 8);
+         idx += static_cast<int>(blockDim.x)) {
+        const int row = idx / (kD / 8);
+        const int col = (idx % (kD / 8)) * 8;
+        *reinterpret_cast<uint4*>(&dst[row][col]) =
+            *reinterpret_cast<const uint4*>(src + row * row_stride + col);
+    }
+}
+
+__global__ __launch_bounds__(kOutThreads, 2) void gdn_volta_output_kernel(
     const __half* __restrict__ q16, const __half* __restrict__ k16,
-    const __half* __restrict__ v_new, const float* __restrict__ g_cumsum,
-    const __half* __restrict__ h_chunk, __nv_bfloat16* __restrict__ out, int H_qk, int H_v,
+    const __half* __restrict__ v_new, const __half* __restrict__ inter,
+    const float* __restrict__ g_cumsum, __nv_bfloat16* __restrict__ out, int H_qk, int H_v,
     float scale) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     OutputSmem& s = *reinterpret_cast<OutputSmem*>(smem_raw);
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
+    const int lane = tid & 31;
     const int c    = static_cast<int>(blockIdx.x);
     const int h    = static_cast<int>(blockIdx.y);
-    const int dv0  = static_cast<int>(blockIdx.z) * kOutCols;
     const int qh   = h / (H_v / H_qk);
     const std::int64_t t0     = static_cast<std::int64_t>(c) * kBT;
     const std::int64_t row_qk = static_cast<std::int64_t>(H_qk) * kD;
     const std::int64_t row_v  = static_cast<std::int64_t>(H_v) * kD;
-    const __half* qc = q16 + t0 * row_qk + qh * kD;
-    const __half* kc = k16 + t0 * row_qk + qh * kD;
-    const __half* hc = h_chunk + ((static_cast<std::int64_t>(c) * H_v + h) * kD + dv0) * kD;
-    const __half* vc = v_new + t0 * row_v + h * kD + dv0;
 
     if (tid < kBT) { s.g[tid] = g_cumsum[(t0 + tid) * H_v + h]; }
+    load_rows_f16(q16 + t0 * row_qk + qh * kD, row_qk, s.qv);
+    load_rows_f16(k16 + t0 * row_qk + qh * kD, row_qk, s.k);
+    __syncthreads();
 
-    // q k^T on the lower block triangle.
-    for (int tile = warp; tile < 10; tile += 4) {
+    // q k^T on the lower block triangle: 10 tiles, at most 2 per warp, held in registers until
+    // k is dead, then staged per warp (over k's storage) and turned into A.
+    FragAcc sacc[2];
+    int stile[2] = {-1, -1};
+    for (int n = 0, tile = warp; tile < 10; ++n, tile += kOutThreads / 32) {
         int ti = 0;
         while ((ti + 1) * (ti + 2) / 2 <= tile) { ++ti; }
         const int tj = tile - ti * (ti + 1) / 2;
-        FragAcc acc;
-        wmma::fill_fragment(acc, 0.0f);
+        wmma::fill_fragment(sacc[n], 0.0f);
 #pragma unroll
         for (int kk = 0; kk < kD / 16; ++kk) {
             FragA a;
             FragBT b;
-            wmma::load_matrix_sync(a, qc + (ti * 16) * row_qk + kk * 16,
-                                   static_cast<unsigned>(row_qk));
-            wmma::load_matrix_sync(b, kc + (tj * 16) * row_qk + kk * 16,
-                                   static_cast<unsigned>(row_qk));
-            wmma::mma_sync(acc, a, b, acc);
+            wmma::load_matrix_sync(a, &s.qv[ti * 16][kk * 16], kHalfLd);
+            wmma::load_matrix_sync(b, &s.k[tj * 16][kk * 16], kHalfLd);
+            wmma::mma_sync(sacc[n], a, b, sacc[n]);
         }
-        wmma::store_matrix_sync(&s.f[ti * 16][tj * 16], acc, kF32Ld64, wmma::mem_row_major);
+        stile[n] = ti * 4 + tj;
     }
     __syncthreads();
-    // Diagonal included; a select keeps exp(G_t - G_s) for s > t (may be +inf) out.
-    for (int idx = tid; idx < kBT * kBT; idx += kThreads) {
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        if (stile[n] < 0) { continue; }
+        const int ti = stile[n] / 4;
+        const int tj = stile[n] % 4;
+        wmma::store_matrix_sync(s.stage[warp], sacc[n], 16, wmma::mem_row_major);
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int e  = lane + 32 * r;
+            const int t  = ti * 16 + e / 16;
+            const int sj = tj * 16 + e % 16;
+            // Diagonal included; a select keeps exp(G_t - G_s) for s > t (may be +inf) out.
+            s.a[t][sj] = __float2half_rn(sj <= t ? s.stage[warp][e] * expf(s.g[t] - s.g[sj])
+                                                 : 0.0f);
+        }
+        __syncwarp();
+    }
+    // Upper block triangle of A is zero.
+    for (int idx = tid; idx < kBT * kBT; idx += kOutThreads) {
         const int t  = idx / kBT;
         const int sj = idx % kBT;
-        s.a[t][sj] = __float2half_rn(sj <= t ? s.f[t][sj] * expf(s.g[t] - s.g[sj]) : 0.0f);
+        if (sj / 16 > t / 16) { s.a[t][sj] = __float2half_rn(0.0f); }
     }
+    __syncthreads();
+    load_rows_f16(v_new + t0 * row_v + h * kD, row_v, s.qv);
     __syncthreads();
 
-    // inter[t][dv] = sum_dk q[t][dk] h_c[dv][dk], then exp(G_t) per row, then += A v_new.
-    for (int tile = warp; tile < 16; tile += 4) {
-        const int ti = tile / 4;
-        const int tj = tile % 4;
-        FragAcc acc;
-        wmma::fill_fragment(acc, 0.0f);
+    // A v_new [64][128]: 32 tiles, 4 per warp (row tile warp&3, column tiles (warp>>2)*4 + j).
+    const int ti = warp & 3;
+    FragAcc acc[4];
 #pragma unroll
-        for (int kk = 0; kk < kD / 16; ++kk) {
-            FragA a;
-            FragBT b;
-            wmma::load_matrix_sync(a, qc + (ti * 16) * row_qk + kk * 16,
-                                   static_cast<unsigned>(row_qk));
-            wmma::load_matrix_sync(b, hc + (tj * 16) * kD + kk * 16, kD);
-            wmma::mma_sync(acc, a, b, acc);
-        }
-        wmma::store_matrix_sync(&s.f[ti * 16][tj * 16], acc, kF32Ld64, wmma::mem_row_major);
-    }
-    __syncthreads();
-    for (int idx = tid; idx < kBT * kOutCols; idx += kThreads) {
-        const int t = idx / kOutCols;
-        s.f[t][idx % kOutCols] *= expf(s.g[t]);
-    }
-    __syncthreads();
-    for (int tile = warp; tile < 16; tile += 4) {
-        const int ti = tile / 4;
-        const int tj = tile % 4;
-        FragAcc acc;
-        wmma::load_matrix_sync(acc, &s.f[ti * 16][tj * 16], kF32Ld64, wmma::mem_row_major);
-        for (int kk = 0; kk <= ti; ++kk) { // A is lower triangular
-            FragA a;
+    for (int j = 0; j < 4; ++j) { wmma::fill_fragment(acc[j], 0.0f); }
+    for (int kk = 0; kk <= ti; ++kk) { // A is lower triangular
+        FragA a;
+        wmma::load_matrix_sync(a, &s.a[ti * 16][kk * 16], kTileLd);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
             FragB b;
-            wmma::load_matrix_sync(a, &s.a[ti * 16][kk * 16], kTileLd);
-            wmma::load_matrix_sync(b, vc + (kk * 16) * row_v + tj * 16,
-                                   static_cast<unsigned>(row_v));
-            wmma::mma_sync(acc, a, b, acc);
+            wmma::load_matrix_sync(b, &s.qv[kk * 16][((warp >> 2) * 4 + j) * 16], kHalfLd);
+            wmma::mma_sync(acc[j], a, b, acc[j]);
         }
-        wmma::store_matrix_sync(&s.f[ti * 16][tj * 16], acc, kF32Ld64, wmma::mem_row_major);
     }
-    __syncthreads();
-    for (int idx = tid; idx < kBT * kOutCols; idx += kThreads) {
-        const int t   = idx / kOutCols;
-        const int col = idx % kOutCols;
-        out[(t0 + t) * row_v + h * kD + dv0 + col] = __float2bfloat16_rn(scale * s.f[t][col]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int tj = (warp >> 2) * 4 + j;
+        wmma::store_matrix_sync(s.stage[warp], acc[j], 16, wmma::mem_row_major);
+        __syncwarp();
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            const int e  = lane + 32 * n;
+            const std::int64_t at = (t0 + ti * 16 + e / 16) * row_v + h * kD + tj * 16 + e % 16;
+            out[at] = __float2bfloat16_rn(scale * (s.stage[warp][e] + __half2float(inter[at])));
+        }
+        __syncwarp();
     }
 }
 
@@ -538,7 +584,9 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     auto* W       = static_cast<__half*>(layout.W.bind(backing).data);
     auto* U       = static_cast<__half*>(layout.U.bind(backing).data);
     auto* v_new   = static_cast<__half*>(layout.v_new.bind(backing).data);
-    auto* h_chunk = static_cast<__half*>(layout.h_chunk.bind(backing).data);
+    // The h_chunk region holds the inter-chunk output term exp(G_t) q_t h_c instead, FP16
+    // [128, H_v, L] (half the region): the state stage computes it while h_c is on chip.
+    auto* inter   = static_cast<__half*>(layout.h_chunk.bind(backing).data);
     auto* q16     = static_cast<__half*>(layout.q16.bind(backing).data);
     auto* k16     = static_cast<__half*>(layout.k16.bind(backing).data);
     const int chunks = L / kBT;
@@ -556,13 +604,13 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), W, U, g_cumsum, q16, k16, H_qk, H_v);
     CUDA_CHECK(cudaGetLastError());
-    gdn_volta_state_kernel<<<H_v * (kD / kStrip), kThreads, sizeof(StateSmem), stream>>>(
-        W, U, k16, g_cumsum, static_cast<const float*>(ssm_state_in.data), v_new, h_chunk,
+    gdn_volta_state_kernel<<<H_v * (kD / kStrip), kStateThreads, sizeof(StateSmem), stream>>>(
+        W, U, k16, q16, g_cumsum, static_cast<const float*>(ssm_state_in.data), v_new, inter,
         static_cast<float*>(ssm_state_out.data), H_qk, H_v, chunks);
     CUDA_CHECK(cudaGetLastError());
-    gdn_volta_output_kernel<<<dim3(chunks, H_v, kD / kOutCols), kThreads, sizeof(OutputSmem),
-                              stream>>>(q16, k16, v_new, g_cumsum, h_chunk,
-                                        static_cast<__nv_bfloat16*>(out.data), H_qk, H_v, scale);
+    gdn_volta_output_kernel<<<dim3(chunks, H_v), kOutThreads, sizeof(OutputSmem), stream>>>(
+        q16, k16, v_new, inter, g_cumsum, static_cast<__nv_bfloat16*>(out.data), H_qk, H_v,
+        scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
