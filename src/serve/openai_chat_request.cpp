@@ -772,7 +772,7 @@ TemplateOptions parse_template_options(const Json& body) {
     }
     for (auto iterator = kwargs.begin(); iterator != kwargs.end(); ++iterator) {
         if (iterator.key() != "enable_thinking" && iterator.key() != "preserve_thinking" &&
-            !iterator.value().is_null()) {
+            iterator.key() != "thinking_budget" && !iterator.value().is_null()) {
             bad_request("chat_template_kwargs." + iterator.key() + " is not supported",
                         "chat_template_kwargs", "chat_template_option_not_supported");
         }
@@ -788,6 +788,34 @@ TemplateOptions parse_template_options(const Json& body) {
     merge("enable_thinking", output.enable_thinking);
     merge("preserve_thinking", output.preserve_thinking);
     return output;
+}
+
+// Per-request thinking cap (the Engine's --default-thinking-budget mechanism):
+// top-level `thinking_budget` (Qwen/vLLM style), its `thinking_budget_tokens`
+// spelling, or chat_template_kwargs.thinking_budget. 0 or null leaves the server
+// default. Applies only when the request thinks.
+void parse_thinking_budget(const Json& body, GenerationRequest& output) {
+    std::optional<std::uint32_t> budget;
+    auto take = [&](const Json& object, const char* key, const std::string& param) {
+        if (!object.contains(key) || object.at(key).is_null()) { return; }
+        const Json& value = object.at(key);
+        if (!value.is_number_integer() || value.get<std::int64_t>() < 0 ||
+            value.get<std::int64_t>() > 0x7fffffff) {
+            bad_request(param + " must be a non-negative integer", param);
+        }
+        const auto n = static_cast<std::uint32_t>(value.get<std::int64_t>());
+        if (n == 0) { return; }
+        if (budget && *budget != n) {
+            bad_request("conflicting thinking budget values", param, "conflicting_template_option");
+        }
+        budget = n;
+    };
+    take(body, "thinking_budget", "thinking_budget");
+    take(body, "thinking_budget_tokens", "thinking_budget_tokens");
+    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object()) {
+        take(body.at("chat_template_kwargs"), "thinking_budget", "chat_template_kwargs.thinking_budget");
+    }
+    if (budget) { output.thinking_budget = *budget; }
 }
 
 void parse_reasoning_effort(const Json& body, GenerationRequest& output) {
@@ -873,6 +901,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     const TemplateOptions template_options = parse_template_options(body);
     output.generation.enable_thinking      = template_options.enable_thinking;
     output.generation.preserve_thinking    = template_options.preserve_thinking;
+    parse_thinking_budget(body, output.generation);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }

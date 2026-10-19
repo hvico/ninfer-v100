@@ -80,13 +80,22 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
     if (request.tool_choice.mode == ToolChoiceMode::Required && !request.uses_tools()) {
         bad_request("required tool choice has no callable tools", "tool_choice");
     }
-    for (const char* alias :
-         {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
-        const bool empty_grammar = std::string_view(alias) == "grammar" && body.contains(alias) &&
-                                   body.at(alias).is_string() &&
-                                   body.at(alias).get_ref<const std::string&>().empty();
-        if (body.contains(alias) && !body.at(alias).is_null() && !empty_grammar) {
+    for (const char* alias : {"guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
+        if (body.contains(alias) && !body.at(alias).is_null()) {
             bad_request("use standard JSON output formats or structured_outputs", alias);
+        }
+    }
+    // llama.cpp's top-level `grammar` (GBNF) is the same constraint as
+    // structured_outputs.grammar; an empty string means none, as in llama.cpp.
+    // Like every NInfer constraint it applies to the answer, after any thinking.
+    if (body.contains("grammar") && !body.at("grammar").is_null()) {
+        const auto& source = body.at("grammar");
+        if (!source.is_string()) { bad_request("grammar must be a string", "grammar", "invalid_grammar"); }
+        if (!source.get_ref<const std::string&>().empty()) {
+            if (body.contains("structured_outputs") && !body.at("structured_outputs").is_null()) {
+                bad_request("grammar and structured_outputs are mutually exclusive", "grammar");
+            }
+            set_constraint(request, OutputConstraint::grammar(source.get<std::string>()), "grammar");
         }
     }
     if (body.contains("structured_outputs") && !body.at("structured_outputs").is_null()) {

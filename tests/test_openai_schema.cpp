@@ -191,7 +191,6 @@ int test_constrained_decoding_extensions() {
     int failures = 0;
     // Vendor-specific spellings are rejected in favor of the standard formats.
     const std::vector<std::pair<const char*, Json>> aliases = {
-        {"grammar", "root ::= \"yes\" | \"no\""},
         {"guided_json", Json{{"type", "object"}}},
         {"guided_regex", "[a-z]+"},
         {"guided_choice", Json::array({"yes", "no"})},
@@ -202,6 +201,38 @@ int test_constrained_decoding_extensions() {
         body[field]          = value;
         const ApiError error = api_error([&] { (void)parse(body); });
         failures += check(error.param == field, std::string(field) + " alias is rejected");
+    }
+    // llama.cpp's top-level GBNF `grammar` is accepted as structured_outputs.grammar.
+    {
+        Json body       = base_request();
+        body["grammar"] = "root ::= \"yes\" | \"no\"";
+        const auto parsed = parse(body);
+        failures += check(parsed.generation.constraint.has_value() &&
+                              parsed.generation.constraint->kind == ninfer::OutputConstraintKind::Grammar,
+                          "top-level grammar becomes a GBNF constraint");
+        body["structured_outputs"] = Json{{"regex", "a"}};
+        failures += check(api_error([&] { (void)parse(body); }).param == "grammar",
+                          "grammar plus structured_outputs is rejected");
+    }
+    // Per-request thinking budget.
+    {
+        Json body              = base_request();
+        body["thinking_budget"] = 1500;
+        failures += check(parse(body).generation.thinking_budget == 1500u, "thinking_budget is parsed");
+        body.erase("thinking_budget");
+        body["chat_template_kwargs"] = Json{{"thinking_budget", 800}};
+        failures += check(parse(body).generation.thinking_budget == 800u,
+                          "chat_template_kwargs.thinking_budget is parsed");
+        body["thinking_budget_tokens"] = 900;
+        failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
+                          "conflicting thinking budgets are rejected");
+        Json zero               = base_request();
+        zero["thinking_budget"] = 0;
+        failures += check(!parse(zero).generation.thinking_budget.has_value(),
+                          "zero thinking_budget keeps the server default");
+        zero["thinking_budget"] = -1;
+        failures += check(api_error([&] { (void)parse(zero); }).param == "thinking_budget",
+                          "negative thinking_budget is rejected");
     }
 
     Json schema               = base_request();
