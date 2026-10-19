@@ -499,6 +499,11 @@ PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Va
 }
 
 template <>
+void Program<Variant>::set_grammar_mask_provider(runtime::GrammarMaskProvider provider) {
+    impl_->grammar_masks = std::move(provider);
+}
+
+template <>
 runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
     std::span<const SequenceHandle<Variant>> sequences, std::span<const TokenId> row_major_tokens,
     std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,

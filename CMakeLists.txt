@@ -108,6 +108,13 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
 endif()
 find_package(Threads REQUIRED)
 
+# Repository-pinned header dependencies. No configure-time downloads.
+add_library(ninfer::json INTERFACE IMPORTED GLOBAL)
+target_include_directories(ninfer::json INTERFACE ${PROJECT_SOURCE_DIR}/third_party)
+
+# CPU grammar source base (constrained decoding); consumers link it explicitly.
+add_subdirectory(third_party/xgrammar EXCLUDE_FROM_ALL)
+
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   # Product operational logging is an offline, repository-pinned dependency. Core-only builds do
   # not configure or link it.

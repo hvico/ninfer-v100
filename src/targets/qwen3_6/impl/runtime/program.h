@@ -694,6 +694,28 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
 
+    // Constrained decoding. Masks are packed [position][word]; each decode row owns
+    // kMtpLookupMaximumWidth positions, followed by one prefill-finalization position per lane.
+    // Both buffers are allocated on the first constrained request.
+    static constexpr std::size_t kGrammarMaskWords =
+        (static_cast<std::size_t>(TextConfig::token_domain) + 31U) / 32U;
+    static constexpr std::size_t kGrammarRowPositions = qwen3_6::kMtpLookupMaximumWidth;
+    static constexpr std::size_t kGrammarMaskPositions =
+        kMaximumConcurrency * kGrammarRowPositions + kMaximumConcurrency;
+    runtime::GrammarMaskProvider grammar_masks;
+    std::optional<DeviceBuffer> grammar_mask_device;
+    std::optional<PinnedHostBuffer> grammar_mask_host;
+
+    [[nodiscard]] bool grammar_constrained(std::uint32_t lane) const {
+        return grammar_masks.constrained && grammar_masks.constrained(lane);
+    }
+    // Fill and upload drafts.size()+1 masks for one constrained decode row; returns the mask
+    // operand for its SamplingConfig.
+    ops::SamplingMask upload_round_masks(std::size_t row, std::uint32_t lane,
+                                         std::span<const TokenId> drafts);
+    // Point the lane's prefill sampling config at the mask for its next sampled token.
+    void refresh_prefill_mask(std::uint32_t lane, const RequestControl& request);
+
 private:
     void advance_resource_revision() noexcept {
         if (++resource_revision_.value == 0) { ++resource_revision_.value; }

@@ -717,17 +717,24 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+    const auto strict = parse_openai_responses_create_request(value, limits());
+    failures += check(strict.prompt.generation.tools.at(0).strict &&
+                          strict.prompt.generation.constrains_tools(),
+                      "strict function schema is constrained");
 
     value         = base;
     value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
+    failures += check(api_error([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }).param == "text.format.name",
+                      "json_schema format without a schema is rejected");
+    value["text"] = Json{{"format", Json{{"type", "json_schema"},
+                                         {"name", "answer"},
+                                         {"schema", Json{{"type", "object"}}}}}};
+    const auto formatted = parse_openai_responses_create_request(value, limits());
+    failures += check(formatted.prompt.generation.constraint &&
+                          formatted.prompt.generation.constraint_param == "text.format.schema",
+                      "text.format json_schema becomes an output constraint");
 
     value               = base;
     value["background"] = true;

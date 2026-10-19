@@ -395,6 +395,19 @@ add_library(ninfer_text STATIC
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
 
+# Output constraints: GBNF/JSON Schema/regex/choice adapters over the vendored XGrammar core.
+add_library(ninfer_grammar STATIC
+  text/grammar.cpp
+  text/json_schema.cpp
+  text/schema_composition.cpp
+  text/json_input.cpp
+  targets/qwen3_6/impl/frontend/tool_grammar.cpp)
+ninfer_internal_includes(ninfer_grammar)
+target_include_directories(ninfer_grammar PRIVATE ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
+target_include_directories(ninfer_grammar SYSTEM PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
+target_link_libraries(ninfer_grammar PUBLIC ninfer_xgrammar PRIVATE ninfer_text ninfer::json)
+
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
 ninfer_internal_includes(ninfer_media_decode)
@@ -444,6 +457,7 @@ target_link_libraries(ninfer_engine
     ninfer_core
     ninfer_ops
     ninfer_text
+    ninfer_grammar
     ninfer_media_decode)
 add_library(ninfer::engine ALIAS ninfer_engine)
 

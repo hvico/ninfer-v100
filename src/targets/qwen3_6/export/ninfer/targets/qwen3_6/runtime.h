@@ -910,6 +910,8 @@ public:
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
                                                runtime::ExecutionTiming* failed_timing = nullptr);
+    // Install the Engine's output-constraint mask source. Called once before any request.
+    void set_grammar_mask_provider(runtime::GrammarMaskProvider provider);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     // Each optional execution split is relative to its row's forced-token span.

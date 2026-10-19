@@ -144,8 +144,12 @@ int test_envelope_and_field_policy() {
                       "Engine top_k range was not enforced");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
+                      "json_schema format without a schema was not rejected");
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    failures += check(parse(body).generation.constraint.has_value(),
+                      "output_config.format did not become an output constraint");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -393,8 +397,8 @@ int test_tools() {
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
     body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    failures += check(parse(body).generation.constrains_tools(),
+                      "active strict tool was not constrained");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
@@ -405,14 +409,16 @@ int test_tools() {
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "forced any-tool choice was silently downgraded");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "forced any-tool choice was not constrained");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "named tool choice was silently downgraded");
+    const GenerationRequest named = parse(body).generation;
+    failures += check(named.tool_choice.mode == ToolChoiceMode::Required &&
+                          named.tool_choice.allowed_names && !named.tool_choice.parallel,
+                      "named tool choice was not constrained to that tool");
     body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
-                      "active single-tool-call guarantee was silently downgraded");
+    failures += check(!parse(body).generation.tool_choice.parallel,
+                      "active single-tool-call guarantee was not applied");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});

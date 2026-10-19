@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -18,6 +19,8 @@ namespace ninfer::runtime {
 using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;
 using ::ninfer::KvCapacityPolicy;
+using ::ninfer::OutputConstraint;
+using ::ninfer::ToolChoice;
 using ::ninfer::OutputChannel;
 using ::ninfer::ResolvedSamplingParameters;
 using ::ninfer::StopPolicy;
@@ -166,6 +169,8 @@ struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    std::optional<OutputConstraint> constraint;
+    ToolChoice tool_choice;
 };
 
 enum class ContinuationAction : std::uint8_t {
@@ -604,6 +609,17 @@ struct PrefillStepResult {
 
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
+};
+
+// Output-constraint token masks for constrained decoding, supplied by the Engine. Program asks
+// `constrained` for each sampled lane; for constrained lanes `fill` writes drafts.size()+1 packed
+// vocabulary masks (32-bit words, bit set = token allowed): position i licenses the token after
+// the committed output plus drafts[0..i). Dead or unreachable positions hold a safe filler.
+struct GrammarMaskProvider {
+    std::function<bool(std::uint32_t lane)> constrained;
+    std::function<void(std::uint32_t lane, std::span<const TokenId> drafts,
+                       std::span<std::uint32_t> words)>
+        fill;
 };
 
 // Target-produced affine reservation curve for one Main KV physical-capacity axis. The byte

@@ -42,7 +42,36 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
+    const bool tools = exception.source() == ninfer::RequestErrorSource::Tools;
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::InvalidToolConstraint:
+        error.status = 400;
+        error.code   = "invalid_tool_constraint";
+        error.param  = "tools" + exception.pointer();
+        break;
+    case ninfer::RequestErrorKind::InvalidGrammar:
+    case ninfer::RequestErrorKind::InvalidChoice:
+    case ninfer::RequestErrorKind::InvalidRegex:
+    case ninfer::RequestErrorKind::ConstraintDeadEnd:
+        error.status = 400;
+        error.param  = "structured_outputs";
+        error.code =
+            exception.kind() == ninfer::RequestErrorKind::InvalidGrammar  ? "invalid_grammar"
+            : exception.kind() == ninfer::RequestErrorKind::InvalidChoice ? "invalid_choice"
+            : exception.kind() == ninfer::RequestErrorKind::InvalidRegex  ? "invalid_regex"
+                                                                          : "constraint_dead_end";
+        break;
+    case ninfer::RequestErrorKind::InvalidJsonSchema:
+    case ninfer::RequestErrorKind::UnsupportedJsonSchema:
+    case ninfer::RequestErrorKind::UnsatisfiableJsonSchema:
+        error.status = 400;
+        error.param  = (tools ? "tools" : "response_format") + exception.pointer();
+        error.code   = exception.kind() == ninfer::RequestErrorKind::InvalidJsonSchema
+                           ? "invalid_json_schema"
+                       : exception.kind() == ninfer::RequestErrorKind::UnsupportedJsonSchema
+                           ? "unsupported_json_schema"
+                           : "unsatisfiable_json_schema";
+        break;
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";

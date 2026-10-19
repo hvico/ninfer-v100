@@ -9,6 +9,8 @@
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "targets/qwen3_6/impl/frontend/tool_call_parser.h"
+#include "targets/qwen3_6/impl/frontend/tool_grammar.h"
+#include "text/grammar.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -19,8 +21,10 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -531,6 +535,9 @@ struct DecoderState {
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
+    // Constrained output: the reasoning channel closes only at the canonical framing the grammar
+    // matches, and content bytes after it are published unchanged.
+    bool exact_reasoning_framing   = false;
     bool strip_content_leading     = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
@@ -541,6 +548,7 @@ struct DecoderState {
 struct SemanticThinkingState {
     std::optional<std::uint32_t> budget;
     std::string close_pending;
+    bool exact_reasoning_framing        = false;
     std::uint32_t model_thinking_tokens = 0;
     std::uint32_t injected_tokens       = 0;
     bool in_reasoning                   = false;
@@ -548,16 +556,21 @@ struct SemanticThinkingState {
     bool applied                        = false;
 };
 
+std::string_view reasoning_close_marker(bool exact) noexcept {
+    return exact ? fi::kCanonicalReasoningCloseSerialization : kThinkClose;
+}
+
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
     if (!state.in_reasoning || bytes.empty()) { return; }
+    const std::string_view marker = reasoning_close_marker(state.exact_reasoning_framing);
     state.close_pending.append(bytes);
-    if (state.close_pending.find(kThinkClose) != std::string::npos) {
+    if (state.close_pending.find(marker) != std::string::npos) {
         state.close_pending.clear();
         state.in_reasoning    = false;
         state.control_pending = false;
         return;
     }
-    const std::size_t hold = longest_suffix_prefix(state.close_pending, kThinkClose, true);
+    const std::size_t hold = longest_suffix_prefix(state.close_pending, marker, true);
     state.close_pending.erase(0, state.close_pending.size() - hold);
 }
 
@@ -652,22 +665,23 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         return;
     }
 
+    const std::string_view close = reasoning_close_marker(state.exact_reasoning_framing);
     state.think_marker_pending.append(text);
-    const std::size_t marker = state.think_marker_pending.find(kThinkClose);
+    const std::size_t marker = state.think_marker_pending.find(close);
     if (marker != std::string::npos) {
         feed_channel(state, OutputChannel::Reasoning,
                      std::string_view(state.think_marker_pending).substr(0, marker), policy,
                      emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
+        std::string content = state.think_marker_pending.substr(marker + close.size());
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
-        state.strip_content_leading = true;
+        state.strip_content_leading = !state.exact_reasoning_framing;
         feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
         return;
     }
 
-    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
+    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, close, true);
     const std::size_t safe = state.think_marker_pending.size() - hold;
     feed_channel(state, OutputChannel::Reasoning,
                  std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
@@ -945,6 +959,25 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool vision_enabled       = true;
     std::uint32_t max_context = 0;
+    mutable std::once_flag grammar_once;
+    mutable std::unique_ptr<text::GrammarCompiler> grammar_compiler;
+
+    // One vocabulary index and compiled-grammar cache per model, built on first constrained use.
+    text::GrammarCompiler& grammars() const {
+        std::call_once(grammar_once, [&] {
+            std::vector<std::string> vocab(kTokenDomain);
+            for (std::size_t id = 0; id < vocab.size(); ++id) {
+                if (!tokenizer->is_valid_token(static_cast<int>(id))) { continue; }
+                const auto decoded = tokenizer->decoded_token(static_cast<int>(id));
+                if (!decoded.special) { vocab[id] = std::string(decoded.bytes); }
+            }
+            grammar_compiler = std::make_unique<text::GrammarCompiler>(
+                std::move(vocab), defaults.token_ids, kGrammarCacheBytes);
+        });
+        return *grammar_compiler;
+    }
+
+    static constexpr std::size_t kGrammarCacheBytes = 256ULL * 1024ULL * 1024ULL;
 };
 
 class OutputSession::Impl {
@@ -952,9 +985,11 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         std::unique_ptr<text::GrammarSession> grammar_ = {})
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
+          grammar(std::move(grammar_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
@@ -963,6 +998,8 @@ public:
             throw std::invalid_argument("thinking budget must be positive");
         }
         state.in_reasoning        = split_reasoning;
+        state.exact_reasoning_framing    = grammar != nullptr;
+        semantic.exact_reasoning_framing = grammar != nullptr;
         prefix_execution.tracking = starts_in_reasoning;
         semantic.budget           = thinking.budget;
         // The presentation decoder already tracks normal reasoning output. Keep the independent
@@ -974,6 +1011,9 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    // Request-owned matcher; tokens are accepted tentatively by a preview and confirmed by its
+    // commit.
+    std::unique_ptr<text::GrammarSession> grammar;
     bool preserve_special = false;
     bool split_reasoning  = false;
     DecoderState state;
@@ -988,6 +1028,12 @@ public:
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready = false;
+
+    // Tentatively advance the matcher through a licensed prefix; returns how many tokens it
+    // accepted. A shortfall is a constraint violation the caller turns into a terminal row.
+    std::size_t accept_grammar(std::span<const TokenId> tokens) {
+        return grammar ? grammar->accept_prefix(tokens) : tokens.size();
+    }
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1092,6 +1138,22 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
 
+    // A constraint violation (an inconsistent mask, or a sampled dead-end filler) ends this row
+    // at the violating token instead of failing the whole batch.
+    bool violation = false;
+    if (impl_->grammar) {
+        const std::size_t valid = impl_->grammar->accept_prefix(tokens);
+        impl_->grammar->discard();
+        if (valid < tokens.size()) {
+            violation = true;
+            std::fprintf(stderr,
+                         "[ninfer] output constraint violated at generated token %d; ending the "
+                         "request\n",
+                         tokens[valid]);
+            tokens = tokens.first(std::max<std::size_t>(valid, 1));
+        }
+    }
+
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
@@ -1099,6 +1161,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
+        (void)impl_->accept_grammar(tokens.first(count));
         impl_->preview_ready = true;
         return runtime::OutputDecision{
             .accepted_tokens              = count,
@@ -1162,6 +1225,10 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
+    if (violation) {
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        return complete(count, FinishReason::StopToken);
+    }
     if (tokens.size() == total_budget_remaining) {
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);
@@ -1237,6 +1304,10 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.control_pending = false;
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    if (impl_->accept_grammar(tokens) != tokens.size()) {
+        impl_->grammar->discard();
+        throw std::logic_error("thinking control violates the request grammar");
+    }
     impl_->preview_ready                    = true;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
@@ -1289,6 +1360,7 @@ PublishedOutput OutputSession::commit_preview() {
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
+    if (impl_->grammar) { impl_->grammar->confirm(); }
 
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {
@@ -1313,6 +1385,22 @@ PublishedOutput OutputSession::commit_preview() {
         }
     }
     return output;
+}
+
+bool OutputSession::constrained() const noexcept {
+    return impl_ != nullptr && impl_->grammar != nullptr;
+}
+
+void OutputSession::grammar_masks(std::span<const TokenId> drafts,
+                                  std::span<std::uint32_t> words) noexcept {
+    try {
+        (void)impl_->grammar->masks(drafts, words);
+    } catch (...) {
+        // Never fail the batch from mask construction: leave the row unconstrained this round;
+        // preview_model then ends it at the first token the matcher rejects.
+        std::fill(words.begin(), words.end(), ~std::uint32_t{0});
+        std::fprintf(stderr, "[ninfer] output constraint mask failed; row unconstrained\n");
+    }
 }
 
 std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
@@ -1424,6 +1512,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    result.tool_jsons          = options.tool_jsons;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -1580,13 +1669,46 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking) const {
+                                            const ThinkingControlOptions& thinking,
+                                            const std::optional<OutputConstraint>& constraint,
+                                            const ToolChoice& tool_choice) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
+    const auto tools =
+        fi::select_tool_grammar(prompt.data_->tool_jsons, tool_choice, constraint.has_value());
+    std::unique_ptr<text::GrammarSession> matcher;
+    if (constraint || tools) {
+        if (tools && constraint && constraint->kind != OutputConstraintKind::JsonObject &&
+            constraint->kind != OutputConstraintKind::JsonSchema) {
+            throw RequestError(text::constraint_error_kind(constraint->kind),
+                               "active tools can be combined only with JSON output constraints");
+        }
+        if (impl_->defaults.token_ids.empty() || !caller_stop.token_ids.empty() ||
+            !caller_stop.strings.empty() || !caller_stop.include_model_defaults ||
+            caller_stop.publish_stop_token || output.raw || output.preserve_special_tokens) {
+            throw RequestError(tools ? RequestErrorKind::InvalidToolConstraint
+                                     : text::constraint_error_kind(constraint->kind),
+                               "output constraints require default EOS, text output and no custom "
+                               "stops",
+                               {}, tools ? RequestErrorSource::Tools
+                                         : RequestErrorSource::OutputConstraint);
+        }
+        const std::string_view close = prompt.data_->starts_in_reasoning
+                                           ? fi::kCanonicalReasoningCloseSerialization
+                                           : std::string_view{};
+        try {
+            matcher = tools ? fi::compile_tool_grammar(impl_->grammars(), *tools, close, constraint)
+                            : impl_->grammars().compile(*constraint, close, {});
+        } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
+            throw RequestError(tools ? RequestErrorKind::InvalidToolConstraint
+                                     : text::constraint_error_kind(constraint->kind),
+                               error.what());
+        }
+    }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output, std::move(matcher)));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

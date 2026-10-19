@@ -110,6 +110,8 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.thinking                = options.execution.thinking;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
+    resolved.constraint                        = std::move(options.constraint);
+    resolved.tool_choice                       = std::move(options.tool_choice);
     return resolved;
 }
 
@@ -411,6 +413,14 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
+    const SpeculativeBackend backend = impl_->options.speculative.backend;
+    if ((backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2) &&
+        (resolved_options.constraint ||
+         resolved_options.tool_choice.mode == ToolChoiceMode::Required ||
+         resolved_options.tool_choice.allowed_names || !resolved_options.tool_choice.parallel)) {
+        throw RequestError(RequestErrorKind::InvalidGrammar,
+                           "output constraints require MTP or no speculative decoding");
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {

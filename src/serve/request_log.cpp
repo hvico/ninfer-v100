@@ -99,6 +99,10 @@ std::string tool_choice_name(const ToolChoice& choice) {
         return "auto";
     case ToolChoiceMode::None:
         return "none";
+    case ToolChoiceMode::Required:
+        return choice.allowed_names && choice.allowed_names->size() == 1 && !choice.parallel
+                   ? "function"
+                   : "required";
     }
     return "unknown";
 }

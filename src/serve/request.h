@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "product/media_acquire/source.h"
 
 #include <ninfer/types.h>
@@ -82,6 +84,7 @@ struct ToolDefinition {
     std::string input_schema_json;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
+    bool strict = false; // arguments must satisfy input_schema (constrained decoding)
 };
 
 struct ToolCall {
@@ -93,10 +96,13 @@ struct ToolCall {
 enum class ToolChoiceMode {
     Auto,
     None,
+    Required,
 };
 
 struct ToolChoice {
     ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::optional<std::vector<std::string>> allowed_names; // named or allowed_tools selection
+    bool parallel = true;
 };
 
 struct ChatTurn {
@@ -186,6 +192,17 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    std::optional<ninfer::OutputConstraint> constraint;
+    std::string constraint_param; // request field that supplied the constraint
+
+    // Tool calls go through constrained decoding: strict tools or a required/named selection.
+    [[nodiscard]] bool constrains_tools() const noexcept {
+        if (!uses_tools()) { return false; }
+        return tool_choice.mode == ToolChoiceMode::Required || tool_choice.allowed_names ||
+               !tool_choice.parallel ||
+               std::any_of(tools.begin(), tools.end(),
+                           [](const ToolDefinition& tool) { return tool.strict; });
+    }
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

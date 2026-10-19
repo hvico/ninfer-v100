@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -113,6 +114,10 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
+    // Output constraints. grammar_masks writes drafts.size()+1 packed vocabulary masks from the
+    // committed output; it never advances the request's matcher.
+    [[nodiscard]] bool constrained() const noexcept;
+    void grammar_masks(std::span<const TokenId> drafts, std::span<std::uint32_t> words) noexcept;
 
 private:
     class Impl;
@@ -141,8 +146,10 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
-                        const OutputOptions& output            = {},
-                        const ThinkingControlOptions& thinking = {}) const;
+                        const OutputOptions& output                       = {},
+                        const ThinkingControlOptions& thinking            = {},
+                        const std::optional<OutputConstraint>& constraint = {},
+                        const ToolChoice& tool_choice                     = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:

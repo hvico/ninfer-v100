@@ -11418,6 +11418,52 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                                device.stream));
 }
 
+namespace {
+void ensure_grammar_mask_buffers(std::optional<DeviceBuffer>& device_masks,
+                                 std::optional<PinnedHostBuffer>& host_masks, std::size_t bytes) {
+    if (!device_masks) { device_masks.emplace(bytes); }
+    if (!host_masks) { host_masks.emplace(bytes); }
+}
+} // namespace
+
+ops::SamplingMask ProgramImplCore::upload_round_masks(std::size_t row, std::uint32_t lane,
+                                                      std::span<const TokenId> drafts) {
+    if (row >= kMaximumConcurrency || drafts.size() >= kGrammarRowPositions) {
+        throw std::logic_error("constrained decode row is outside the mask layout");
+    }
+    constexpr std::size_t words = kGrammarMaskWords;
+    ensure_grammar_mask_buffers(grammar_mask_device, grammar_mask_host,
+                                kGrammarMaskPositions * words * sizeof(std::uint32_t));
+    const std::size_t offset = row * kGrammarRowPositions * words;
+    const std::size_t count  = (drafts.size() + 1U) * words;
+    auto* host = static_cast<std::uint32_t*>(grammar_mask_host->data()) + offset;
+    grammar_masks.fill(lane, drafts, std::span<std::uint32_t>(host, count));
+    auto* device_words = static_cast<std::uint32_t*>(grammar_mask_device->p) + offset;
+    CUDA_CHECK(cudaMemcpyAsync(device_words, host, count * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, device.stream));
+    return ops::SamplingMask{.words = device_words, .stride = static_cast<std::int32_t>(words)};
+}
+
+void ProgramImplCore::refresh_prefill_mask(std::uint32_t lane, const RequestControl& request) {
+    if (!grammar_constrained(lane)) { return; }
+    constexpr std::size_t words = kGrammarMaskWords;
+    ensure_grammar_mask_buffers(grammar_mask_device, grammar_mask_host,
+                                kGrammarMaskPositions * words * sizeof(std::uint32_t));
+    const std::size_t offset = (kMaximumConcurrency * kGrammarRowPositions + lane) * words;
+    auto* host               = static_cast<std::uint32_t*>(grammar_mask_host->data()) + offset;
+    grammar_masks.fill(lane, {}, std::span<std::uint32_t>(host, words));
+    auto* device_words = static_cast<std::uint32_t*>(grammar_mask_device->p) + offset;
+    CUDA_CHECK(cudaMemcpyAsync(device_words, host, words * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, device.stream));
+    ops::SamplingConfig config = request.sampling_host;
+    config.mask = ops::SamplingMask{.words = device_words, .stride = static_cast<std::int32_t>(words)};
+    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config), cudaMemcpyHostToDevice,
+                               device.stream));
+    // The pinned source is reused by the next refresh; complete this upload first.
+    device.synchronize();
+}
+
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
@@ -11557,6 +11603,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 .timing  = timing.finish(),
             };
         }
+        // A finalizing chunk or exact-hit tail samples the first output token from this lane's
+        // device config; constrained requests carry the mask for their current matcher state.
+        refresh_prefill_mask(sequence.lane, request);
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
@@ -11886,6 +11935,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            if (grammar_constrained(lanes[row])) {
+                ordinary_host_ingress->sampling[row].mask = upload_round_masks(row, lanes[row], {});
+            }
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
@@ -12084,6 +12136,12 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            if (grammar_constrained(lanes[row])) {
+                mtp_host_ingress->sampling[row].mask = upload_round_masks(
+                    row, lanes[row],
+                    std::span<const TokenId>(mtp_host_ingress->current_drafts.data() + row * verify_k,
+                                             extent));
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
@@ -12281,6 +12339,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
+            if (grammar_constrained(lanes[row])) {
+                throw RequestError(RequestErrorKind::InvalidGrammar,
+                                   "output constraints are not supported with DFlash decoding");
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }

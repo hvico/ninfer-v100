@@ -98,7 +98,7 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
     Json schema = Json::parse(tool.input_schema_json);
-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", false}};
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
     if (!tool.description.empty()) { function["description"] = tool.description; }
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
@@ -304,7 +304,19 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
-    options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    // Constrained output publishes text only; the grammar owns the tool-call framing.
+    options.output.preserve_special_tokens = !request.constraint && !request.constrains_tools() &&
+                                             (request.uses_tools() || request.has_tool_history());
+    options.constraint = request.constraint;
+    if (request.uses_tools()) {
+        options.tool_choice.mode = request.tool_choice.mode == ToolChoiceMode::Required
+                                       ? ninfer::ToolChoiceMode::Required
+                                       : ninfer::ToolChoiceMode::Auto;
+        options.tool_choice.allowed_names = request.tool_choice.allowed_names;
+        options.tool_choice.parallel      = request.tool_choice.parallel;
+    } else {
+        options.tool_choice.mode = ninfer::ToolChoiceMode::None;
+    }
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));

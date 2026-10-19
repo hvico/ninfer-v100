@@ -398,3 +398,27 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+# Output constraints (vendored XGrammar core + NInfer adapters).
+ninfer_add_test(ninfer_grammar_test
+  SOURCES test_grammar.cpp
+  LIBRARIES ninfer_grammar)
+ninfer_add_test(ninfer_regex_choice_test
+  SOURCES text/test_regex_choice.cpp
+  LIBRARIES ninfer_grammar ninfer::json)
+ninfer_add_test(ninfer_json_schema_test
+  SOURCES text/test_json_schema.cpp
+  LIBRARIES ninfer_grammar ninfer::json)
+add_test(NAME ninfer_regex_choice_oracle_test
+  COMMAND ${CMAKE_COMMAND} -E env "NINFER_REGEX_PROBE=$<TARGET_FILE:ninfer_regex_choice_test>"
+    ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_regex_choice.py)
+# The JSON Schema oracle needs jsonschema (tests/text/requirements.txt); skip it without it.
+execute_process(COMMAND ${Python3_EXECUTABLE} -c "import jsonschema"
+                RESULT_VARIABLE ninfer_jsonschema_missing OUTPUT_QUIET ERROR_QUIET)
+if(ninfer_jsonschema_missing)
+  message(STATUS "jsonschema not found for ${Python3_EXECUTABLE}: JSON Schema oracle test skipped")
+else()
+add_test(NAME ninfer_json_schema_oracle_test
+  COMMAND ${CMAKE_COMMAND} -E env "NINFER_SCHEMA_PROBE=$<TARGET_FILE:ninfer_json_schema_test>"
+    ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_json_schema.py)
+endif()

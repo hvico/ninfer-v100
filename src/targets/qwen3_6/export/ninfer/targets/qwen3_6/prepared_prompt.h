@@ -8,6 +8,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -148,6 +149,8 @@ struct PreparedPromptData {
     PromptIdentity identity;
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
+    // Tool declarations as rendered for the template; output constraints compile from them.
+    std::vector<std::string> tool_jsons;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

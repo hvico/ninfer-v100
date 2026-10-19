@@ -788,19 +788,18 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         if (std::none_of(definitions.begin(), definitions.end(), named)) {
             bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
         }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+        request.tool_choice.allowed_names = std::vector<std::string>{selection.name};
+        request.tool_choice.parallel      = false;
     }
-    if (selection.kind == ToolSelectionKind::Any) {
-        if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
+        bad_request("tool_choice requires tools", "tool_choice");
     }
 
-    request.tool_choice.mode =
-        selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None : ToolChoiceMode::Auto;
+    request.tool_choice.mode = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None
+                               : selection.kind == ToolSelectionKind::Any ||
+                                       selection.kind == ToolSelectionKind::Named
+                                   ? ToolChoiceMode::Required
+                                   : ToolChoiceMode::Auto;
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
@@ -821,11 +820,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
+        tool.definition.strict = tool.strict;
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -840,11 +835,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
-    }
+    if (selection.disable_parallel) { request.tool_choice.parallel = false; }
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
@@ -899,9 +890,8 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        parse_json_output_format(config.at("format"), request, "output_config.format",
+                                 JsonFormatProtocol::Anthropic);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1063,6 +1053,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                         result.generation.max_tokens);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 

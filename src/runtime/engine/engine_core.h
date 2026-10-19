@@ -81,6 +81,19 @@ public:
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        // Only the worker thread decodes, so the provider reads lane slots without locking.
+        instance_.program->set_grammar_mask_provider(runtime::GrammarMaskProvider{
+            .constrained =
+                [this](std::uint32_t lane) {
+                    return lane < kMaximumConcurrency && slots_[lane] != nullptr &&
+                           slots_[lane]->output.constrained();
+                },
+            .fill =
+                [this](std::uint32_t lane, std::span<const TokenId> drafts,
+                       std::span<std::uint32_t> words) {
+                    slots_[lane]->output.grammar_masks(drafts, words);
+                },
+        });
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -199,7 +212,8 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.loaded->frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking);
+                prompt, options.stop, options.output, options.execution.thinking,
+                options.constraint, options.tool_choice);
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
             try {
