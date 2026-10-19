@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <future>
@@ -1913,6 +1914,14 @@ private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
+        // The cause is otherwise lost: every request only sees "internal error".
+        try {
+            if (error) { std::rethrow_exception(error); }
+        } catch (const std::exception& cause) {
+            std::fprintf(stderr, "[ninfer] engine failed: %s\n", cause.what());
+        } catch (...) {
+            std::fprintf(stderr, "[ninfer] engine failed: unknown exception\n");
+        }
         std::deque<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);

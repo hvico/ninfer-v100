@@ -32,6 +32,8 @@ public:
     // Tentatively accept the longest valid prefix of `tokens`; returns its length. Never throws
     // for a grammar violation, so a serving engine can end one request instead of failing.
     [[nodiscard]] std::size_t accept_prefix(std::span<const std::int32_t> tokens) noexcept;
+    // True once the matcher accepted a stop token (tentatively or not).
+    [[nodiscard]] bool terminated() const noexcept;
     void confirm() noexcept;
     void discard();
     [[nodiscard]] std::size_t mask_words() const noexcept;

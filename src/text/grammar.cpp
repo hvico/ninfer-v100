@@ -8,6 +8,8 @@
 #include "regex_converter.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <stdexcept>
 
@@ -102,12 +104,16 @@ std::string quoted(unsigned char c) {
 }
 
 // A small DFA consumes through the first complete delimiter, including delimiters split across
-// tokens. Concatenation keeps the user's rule names in their own namespace.
+// tokens, then up to kReasoningGap whitespace bytes (Qwen closes with "</think>\n\n", the canonical
+// thinking-budget control ends the same way). Concatenation keeps the user's rule names in their
+// own namespace.
+constexpr int kReasoningGap = 8;
 xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
     std::string alphabet(delimiter);
     std::sort(alphabet.begin(), alphabet.end());
     alphabet.erase(std::unique(alphabet.begin(), alphabet.end()), alphabet.end());
     std::string source = "root ::= s0\n";
+    source += "gap ::= [ \\t\\r\\n]{0," + std::to_string(kReasoningGap) + "}\n";
     for (std::size_t state = 0; state < delimiter.size(); ++state) {
         source += "s" + std::to_string(state) + " ::= ";
         for (unsigned char c : alphabet) {
@@ -116,7 +122,7 @@ xgrammar::Grammar reasoning_prefix(std::string_view delimiter) {
             std::size_t matched = std::min(next.size(), delimiter.size());
             while (matched && !next.ends_with(delimiter.substr(0, matched))) { --matched; }
             source += quoted(c);
-            if (matched != delimiter.size()) { source += " s" + std::to_string(matched); }
+            source += matched != delimiter.size() ? " s" + std::to_string(matched) : " gap";
             source += " | ";
         }
         source += "[^";
@@ -199,6 +205,10 @@ public:
     std::int32_t filler;
     int tentative = 0;
     ConstraintObservation observed;
+    // Debug (NINFER_GRAMMAR_DEBUG): the last lookahead transaction, to diagnose violations.
+    std::vector<std::int32_t> last_drafts;
+    std::vector<std::uint32_t> last_masks;
+    int masks_since_confirm = 0;
 
     void fill(std::span<std::uint32_t> target) {
         if (matcher.IsTerminated()) {
@@ -360,6 +370,12 @@ std::uint32_t GrammarSession::masks(std::span<const std::int32_t> drafts,
         throw;
     }
     if (advanced) { impl_->matcher.Rollback(advanced); }
+    static const bool debug = std::getenv("NINFER_GRAMMAR_DEBUG") != nullptr;
+    if (debug) {
+        impl_->last_drafts.assign(drafts.begin(), drafts.end());
+        impl_->last_masks.assign(words.begin(), words.end());
+    }
+    ++impl_->masks_since_confirm;
     return dead;
 }
 
@@ -376,14 +392,42 @@ void GrammarSession::accept(std::span<const std::int32_t> tokens) {
 
 std::size_t GrammarSession::accept_prefix(std::span<const std::int32_t> tokens) noexcept {
     std::size_t accepted = 0;
+    bool completed_before = false, terminated_before = false;
     try {
         WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
         for (const auto token : tokens) {
-            if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token)) break;
+            completed_before  = impl_->matcher.IsCompleted();
+            terminated_before = impl_->matcher.IsTerminated();
+            if (terminated_before || !impl_->matcher.AcceptToken(token)) break;
             ++impl_->tentative;
             ++accepted;
         }
     } catch (...) {}
+    static const bool debug = std::getenv("NINFER_GRAMMAR_DEBUG") != nullptr;
+    if (debug && accepted < tokens.size()) {
+        const std::size_t i = accepted;
+        std::string line = "[grammar-debug] reject at " + std::to_string(i) + "/" +
+                           std::to_string(tokens.size()) + " token " + std::to_string(tokens[i]) +
+                           " completed=" + std::to_string(completed_before) +
+                           " terminated=" + std::to_string(terminated_before) +
+                           " masks_since_confirm=" + std::to_string(impl_->masks_since_confirm) +
+                           " tokens=[";
+        for (auto t : tokens) line += std::to_string(t) + ",";
+        line += "] drafts=[";
+        for (auto t : impl_->last_drafts) line += std::to_string(t) + ",";
+        line += "]";
+        const std::size_t w = impl_->words;
+        if (!impl_->last_masks.empty() && (i + 1) * w <= impl_->last_masks.size()) {
+            const auto bit = (impl_->last_masks[i * w + tokens[i] / 32] >> (tokens[i] % 32)) & 1u;
+            std::size_t allowed = 0;
+            for (std::size_t k = 0; k < w; ++k)
+                allowed += static_cast<std::size_t>(__builtin_popcount(impl_->last_masks[i * w + k]));
+            line += " mask_bit=" + std::to_string(bit) + " allowed=" + std::to_string(allowed);
+        } else {
+            line += " mask_pos_missing";
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
     return accepted;
 }
 
@@ -404,7 +448,12 @@ ConstraintObservation GrammarSession::observation() const {
     return result;
 }
 
-void GrammarSession::confirm() noexcept { impl_->tentative = 0; }
+bool GrammarSession::terminated() const noexcept { return impl_->matcher.IsTerminated(); }
+
+void GrammarSession::confirm() noexcept {
+    impl_->tentative           = 0;
+    impl_->masks_since_confirm = 0;
+}
 
 void GrammarSession::discard() {
     WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);

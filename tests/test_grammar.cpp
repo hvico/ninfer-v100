@@ -291,6 +291,34 @@ int main() {
         thinking->confirm();
         require(allows(mask(*thinking), 256), "thinking wrapper did not reach content completion");
 
+        // The serving prefix ends at the plain "</think>" marker the output channels use, then
+        // admits a bounded whitespace gap before the constrained answer.
+        auto think_close = compile(compiler, "root ::= \"{}\"", "</think>", {});
+        consume(*think_close, "reason\n</think>");
+        require(allows(mask(*think_close), '{') && allows(mask(*think_close), '\n'),
+                "answer or gap not admitted right after </think>");
+        consume(*think_close, "\n\n{}");
+        require(allows(mask(*think_close), 256), "gap plus answer did not complete");
+        auto long_gap = compile(compiler, "root ::= \"{}\"", "</think>", {});
+        consume(*long_gap, "r</think>        ");
+        require(!allows(mask(*long_gap), ' ') && allows(mask(*long_gap), '{'),
+                "reasoning gap is not bounded");
+        // A partial marker at the thinking-budget boundary followed by the canonical control text
+        // (the sequence that used to fail the engine with the exact "\n</think>\n\n" marker).
+        auto boundary = compile(compiler, "root ::= \"{}\"", "</think>", {});
+        consume(*boundary, "reason\n</thi");
+        consume(*boundary, "\n\n Considering the limited time by the user, I have to give the "
+                           "solution based on the thinking directly now.\n</think>\n\n{}");
+        require(allows(mask(*boundary), 256), "control after a partial marker did not complete");
+        // A speculative round may carry tokens after the stop token: accept_prefix stops at the
+        // stop token and the session reports termination, so it is not a violation.
+        auto post_eos = compile(compiler, "root ::= \"a\"", {}, {});
+        const std::array<std::int32_t, 3> round{'a', 256, 256};
+        require(post_eos->accept_prefix(round) == 2 && post_eos->terminated(),
+                "post-EOS speculative token was not separated from a violation");
+        post_eos->discard();
+        require(!post_eos->terminated(), "discard did not undo tentative termination");
+
         for (const auto& source : {"bad grammar", "root ::= missing", "root ::= Token(256)",
                                    "root ::= Regex(\".*\")", "root[temperature=0.5] ::= \"a\""}) {
             bool rejected = false;

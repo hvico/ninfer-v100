@@ -998,8 +998,8 @@ public:
             throw std::invalid_argument("thinking budget must be positive");
         }
         state.in_reasoning        = split_reasoning;
-        state.exact_reasoning_framing    = grammar != nullptr;
-        semantic.exact_reasoning_framing = grammar != nullptr;
+        state.exact_reasoning_framing    = false;
+        semantic.exact_reasoning_framing = false;
         prefix_execution.tracking = starts_in_reasoning;
         semantic.budget           = thinking.budget;
         // The presentation decoder already tracks normal reasoning output. Keep the independent
@@ -1034,6 +1034,10 @@ public:
     std::size_t accept_grammar(std::span<const TokenId> tokens) {
         return grammar ? grammar->accept_prefix(tokens) : tokens.size();
     }
+
+    // Set when forced thinking-control tokens could not be matched: the row ends at its next
+    // model round instead of failing the engine.
+    bool grammar_broken = false;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1141,10 +1145,19 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     // A constraint violation (an inconsistent mask, or a sampled dead-end filler) ends this row
     // at the violating token instead of failing the whole batch.
     bool violation = false;
-    if (impl_->grammar) {
+    if (impl_->grammar_broken) {
+        violation = true;
+        tokens    = tokens.first(1);
+    } else if (impl_->grammar) {
         const std::size_t valid = impl_->grammar->accept_prefix(tokens);
+        // A speculative round can carry tokens after the stop token that completed the grammar;
+        // they are never committed (the stop loop below ends the row there), so only a
+        // rejection before termination is a violation.
+        const bool ended        = valid > 0 && impl_->grammar->terminated();
         impl_->grammar->discard();
-        if (valid < tokens.size()) {
+        if (valid < tokens.size() && ended) {
+            tokens = tokens.first(valid);
+        } else if (valid < tokens.size()) {
             violation = true;
             std::fprintf(stderr,
                          "[ninfer] output constraint violated at generated token %d; ending the "
@@ -1305,8 +1318,14 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     if (impl_->accept_grammar(tokens) != tokens.size()) {
+        // Never fail the engine for one request: commit the control, drop the matcher and end
+        // the row at its next model round.
         impl_->grammar->discard();
-        throw std::logic_error("thinking control violates the request grammar");
+        impl_->grammar.reset();
+        impl_->grammar_broken = true;
+        std::fprintf(stderr,
+                     "[ninfer] thinking control does not match the request grammar; ending the "
+                     "request\n");
     }
     impl_->preview_ready                    = true;
     return runtime::OutputDecision{
@@ -1394,6 +1413,7 @@ bool OutputSession::constrained() const noexcept {
 void OutputSession::grammar_masks(std::span<const TokenId> drafts,
                                   std::span<std::uint32_t> words) noexcept {
     try {
+        if (impl_->grammar == nullptr) throw std::logic_error("row is no longer constrained");
         (void)impl_->grammar->masks(drafts, words);
     } catch (...) {
         // Never fail the batch from mask construction: leave the row unconstrained this round;
@@ -1694,9 +1714,12 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                {}, tools ? RequestErrorSource::Tools
                                          : RequestErrorSource::OutputConstraint);
         }
-        const std::string_view close = prompt.data_->starts_in_reasoning
-                                           ? fi::kCanonicalReasoningCloseSerialization
-                                           : std::string_view{};
+        // The grammar's reasoning prefix ends at the same "</think>" marker the output channels
+        // use. The exact canonical framing ("\n</think>\n\n") could complete inside the
+        // thinking-budget control text when the model's own close sat at the budget boundary,
+        // leaving grammar and channels disagreeing and failing the whole engine.
+        const std::string_view close =
+            prompt.data_->starts_in_reasoning ? kThinkClose : std::string_view{};
         try {
             matcher = tools ? fi::compile_tool_grammar(impl_->grammars(), *tools, close, constraint)
                             : impl_->grammars().compile(*constraint, close, {});
